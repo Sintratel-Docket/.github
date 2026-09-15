@@ -1,0 +1,113 @@
+name: Reusable - Build and Push to ECR
+
+# Shared continuous-delivery tail for every SINTRATEL Docket microservice.
+#
+# It is intentionally stack-agnostic: each microservice runs its own
+# language-specific lint/test/build-check jobs and then calls this workflow
+# to perform the identical, security-sensitive steps:
+#
+#   OIDC auth to AWS  ->  ECR login  ->  semantic-release (semver + tag +
+#   changelog + GitHub release)  ->  docker build  ->  push immutable tag.
+#
+# The image is built from the caller repository's own Dockerfile. No AWS
+# long-lived credentials are used; authentication is via GitHub OIDC.
+
+on:
+  workflow_call:
+    inputs:
+      ecr_repository:
+        description: "ECR repository name, e.g. docket/todos-api"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region of the ECR registry"
+        required: false
+        default: us-east-1
+        type: string
+      aws_role_arn:
+        description: "IAM role ARN assumed via GitHub OIDC to push images"
+        required: false
+        default: arn:aws:iam::429418377318:role/GitHubActionsECRPush
+        type: string
+      node_version:
+        description: "Node.js version used to run semantic-release"
+        required: false
+        default: "22"
+        type: string
+
+# Least privilege by default; the job widens only what it needs.
+permissions: {}
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # request the OIDC token for AWS
+      contents: write # semantic-release pushes the tag and CHANGELOG commit
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx -y \
+            -p semantic-release@24 \
+            -p @semantic-release/commit-analyzer \
+            -p @semantic-release/release-notes-generator \
+            -p @semantic-release/changelog \
+            -p @semantic-release/git \
+            -p @semantic-release/github \
+            semantic-release
+
+      - name: Resolve image tag from released version
+        id: tag
+        run: |
+          SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+          if [ -z "$VERSION" ]; then
+            echo "No release was produced by semantic-release; skipping image push."
+            echo "skip_push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_push=false" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${VERSION}-${SHA}" >> "$GITHUB_OUTPUT"
+            echo "Image tag will be: ${VERSION}-${SHA}"
+          fi
+
+      - name: Build Docker image
+        if: steps.tag.outputs.skip_push == 'false'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: docker build -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" .
+
+      - name: Push Docker image to Amazon ECR
+        if: steps.tag.outputs.skip_push == 'false'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "Pushed ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
