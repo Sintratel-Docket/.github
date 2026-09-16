@@ -132,6 +132,13 @@ jobs:
       - name: Upload release image SARIF
         if: steps.tag.outputs.skip_push == 'false'
         uses: github/codeql-action/upload-sarif@v4
+        # Tolerated on purpose: code scanning needs GitHub Advanced Security
+        # on private repositories, and the five service repos are private. The
+        # upload then returns 403 and would fail the pipeline for a reason that
+        # has nothing to do with security findings. The gate steps below still
+        # print every finding in the job log, so nothing is lost. If GHAS is
+        # ever enabled, these steps start working with no change.
+        continue-on-error: true
         with:
           sarif_file: trivy-release.sarif
           category: trivy-release-image

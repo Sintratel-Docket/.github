@@ -76,6 +76,13 @@ surface before merge rather than at push-to-ECR time.
 | `trivy_exit_code` | no | `"0"` | `"1"` fails the build on findings, `"0"` only reports |
 | `ignore_unfixed` | no | `true` | Ignore vulnerabilities with no fix available |
 
+> **Where findings appear.** Every finding is printed in full in the job log,
+> under the `Gate on findings` steps. They are *also* uploaded to the Security
+> tab, but code scanning requires GitHub Advanced Security on private
+> repositories — the five service repos are private, so the upload is marked
+> `continue-on-error` and is expected to be skipped there. The job log is the
+> reliable place to read results.
+
 > Both scan gates ship in **warn mode**. Flip `trivy_exit_code` to `"1"` per
 > repository once the existing findings have been triaged, so enabling security
 > scanning does not break all five pipelines on day one.
