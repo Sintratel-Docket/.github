@@ -1,0 +1,120 @@
+name: Reusable - Security Scan (Trivy)
+
+# Shared security gate for every SINTRATEL Docket microservice.
+#
+# It replaces the old per-repo `docker-build-check` job: it still proves the
+# Dockerfile builds, and then scans both the source tree and the resulting
+# image with Trivy. The scan logic is identical for every stack (Go, Java,
+# Node, Python, Vue), so it lives here once instead of in five ci.yml files.
+#
+#   docker build  ->  trivy fs (vuln + secret + misconfig)  ->  trivy image
+#
+# Every scan runs twice on purpose: once producing SARIF (never fails, so the
+# findings always reach GitHub code scanning) and once producing a table that
+# enforces the gate. Trivy silently ignores `exit-code` when writing SARIF,
+# so a single step cannot both report and block.
+#
+# The gate starts in warn mode (`trivy_exit_code: "0"`). Flip it to "1" per
+# repository once the existing findings have been triaged.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Local image name to build and scan, e.g. todos-api"
+        required: true
+        type: string
+      trivy_severity:
+        description: "Severities the gate considers"
+        required: false
+        default: HIGH,CRITICAL
+        type: string
+      trivy_exit_code:
+        description: '"1" fails the build on findings, "0" only reports them'
+        required: false
+        default: "0"
+        type: string
+      ignore_unfixed:
+        description: "Ignore vulnerabilities that have no fix available yet"
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+jobs:
+  build-and-scan:
+    name: Build and Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout the caller repository
+      security-events: write # upload SARIF to GitHub code scanning
+    env:
+      IMAGE_REF: ${{ inputs.image_name }}:${{ github.sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build Docker image
+        run: docker build -t "${IMAGE_REF}" .
+
+      # --- Report: SARIF to the Security tab, never fails the build ---------
+
+      - name: Scan source tree (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+
+      - name: Upload source-tree SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Scan image (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+
+      - name: Upload image SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # --- Gate: readable output, fails when trivy_exit_code is "1" ---------
+
+      - name: Gate on source-tree findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          exit-code: ${{ inputs.trivy_exit_code }}
+
+      - name: Gate on image findings
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          exit-code: ${{ inputs.trivy_exit_code }}
